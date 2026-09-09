@@ -1,5 +1,4 @@
 import json
-import logging
 import os
 import re
 import tempfile
@@ -9,19 +8,16 @@ from collections import Counter
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 MAX_FILE_SIZE = 20 * 1024 * 1024
 
 SERVICE_LINE = re.compile(
     r"^\s*(?:"
-    r"(?:Channel|Group|Chat) (?:created|photo changed|title changed)|"
-    r"(?:Канал|Группа|Чат) (?:создан|изменил(?:а)? фото|изменил(?:а)? название)|"
+    r"(?:Channel|Group|Chat).*(?:created|photo changed|title changed)|"
+    r"(?:Канал|Группа|Чат).*(?:создан|изменил(?:а)? фото|изменил(?:а)? название)|"
     r"(?:Создан(?:а)? (?:канал|группа|чат)|Изменено фото|Изменено название)"
-    r")\.?\s*$",
+    r").*$",
     re.IGNORECASE,
 )
 MEDIA_LINE = re.compile(r"^\s*!\[[^\]]*\]\([^)]*\)\s*$")
@@ -30,63 +26,70 @@ REACTION_LINE = re.compile(
     r"(?:\s*\d+)?\s*)+$"
 )
 TIME_LINE = re.compile(r"^\s*(?:\*\*)?(\d{1,2}:\d{2})(?:\*\*)?\s*$")
-NUMBER_DATE_LINE = re.compile(
+NUMBER_DATE = re.compile(
     r"^\s*(?:#{1,6}\s*)?"
     r"(\d{1,2}[./-]\d{1,2}[./-]\d{2,4}|\d{4}[./-]\d{1,2}[./-]\d{1,2})\s*$"
 )
-TEXT_DATE_LINE = re.compile(
-    r"^\s*(\d{1,2}\s+[A-Za-zА-Яа-яЁё]+\s+\d{4})\s*$"
-)
-HEADING_LINE = re.compile(r"^\s*#\s+(.+?)\s*$")
-INVALID_FILENAME = re.compile(r"[^\w. -]+", re.UNICODE)
+TEXT_DATE = re.compile(r"^\s*(\d{1,2}\s+[A-Za-zА-Яа-яЁё]+\s+\d{4})\s*$")
+HEADING = re.compile(r"^\s*#\s+(.+?)\s*$")
+BAD_FILENAME = re.compile(r"[^\w. -]+", re.UNICODE)
 
 
 def clean_markdown(text):
-    source_bytes = len(text.encode("utf-8"))
-    raw_lines = [line.rstrip() for line in text.splitlines()]
+    before = len(text.encode("utf-8"))
+    raw = [line.rstrip() for line in text.splitlines()]
+    removed = 0
 
     counts = Counter(
-        line for line in raw_lines
+        line for line in raw
         if line.strip()
         and len(line) < 120
         and not line.startswith(("http://", "https://", "#", "*", "—", "@"))
-        and not NUMBER_DATE_LINE.match(line)
-        and not TEXT_DATE_LINE.match(line)
+        and not NUMBER_DATE.match(line)
+        and not TEXT_DATE.match(line)
         and not TIME_LINE.match(line)
     )
     channel_titles = {line for line, count in counts.items() if count >= 3}
 
     output = []
-    removed = 0
     previous_blank = True
     title_written = False
     source_written = False
     index = 0
 
-    while index < len(raw_lines):
-        line = raw_lines[index]
-        next_line = raw_lines[index + 1] if index + 1 < len(raw_lines) else ""
+    while index < len(raw):
+        line = raw[index]
+        next_line = raw[index + 1] if index + 1 < len(raw) else ""
 
+        # Первое имя файла экспорта, например «Central Александра Горного 1».
+        if index == 0 and re.search(r"\s+\d+$", line):
+            removed += 1
+            index += 1
+            continue
+
+        # Технический разделитель Telegram.
         if line == "G":
             removed += 1
             index += 1
             continue
 
+        # Повторяющийся footer: «—» и следующая строка «@канал — описание».
         if line == "—" and next_line.startswith("@") and "—" in next_line:
             if not source_written:
-                source_name = next_line.split("—", 1)[0].strip()
-                output.append(f"*Источник: {source_name}*")
+                output.append(f"*Источник: {next_line.split('—', 1)[0].strip()}*")
                 previous_blank = False
                 source_written = True
             removed += 2
             index += 2
             continue
 
+        # Сервисные строки, изображения и реакции.
         if SERVICE_LINE.match(line) or MEDIA_LINE.match(line) or REACTION_LINE.match(line):
             removed += 1
             index += 1
             continue
 
+        # Повтор канала оставляем один раз как заголовок.
         if line in channel_titles:
             if not title_written:
                 output.append(f"# {line}")
@@ -97,8 +100,8 @@ def clean_markdown(text):
             index += 1
             continue
 
-        number_date = NUMBER_DATE_LINE.match(line)
-        text_date = TEXT_DATE_LINE.match(line)
+        number_date = NUMBER_DATE.match(line)
+        text_date = TEXT_DATE.match(line)
         time = TIME_LINE.match(line)
 
         if number_date:
@@ -117,24 +120,34 @@ def clean_markdown(text):
         previous_blank = blank
         index += 1
 
-    while output and not output[-1].strip():
-        output.pop()
+    # Убираем даты, в которых после очистки не осталось ни одного поста.
+    result_lines = []
+    for position, line in enumerate(output):
+        if line.startswith("## "):
+            following = output[position + 1] if position + 1 < len(output) else ""
+            if not following or following.startswith("## "):
+                removed += 1
+                continue
+        result_lines.append(line)
 
-    result = "\n".join(output)
+    while result_lines and not result_lines[-1].strip():
+        result_lines.pop()
+
+    result = "\n".join(result_lines)
     if result:
         result += "\n"
 
-    return result, source_bytes, len(result.encode("utf-8")), removed
+    return result, before, len(result.encode("utf-8")), removed
 
 
 def output_filename(original_name, text):
     stem = Path(original_name).stem or "telegram-export"
     for line in text.splitlines():
-        heading = HEADING_LINE.match(line)
-        if heading and not NUMBER_DATE_LINE.match(heading.group(1)):
+        heading = HEADING.match(line)
+        if heading:
             stem = heading.group(1)
             break
-    stem = INVALID_FILENAME.sub("-", stem).strip(" .-")
+    stem = BAD_FILENAME.sub("-", stem).strip(" .-")
     return f"{(stem or 'telegram-export')[:100]}.clean.md"
 
 
@@ -148,7 +161,6 @@ def telegram_json(method, payload):
         with urllib.request.urlopen(request, timeout=30) as response:
             return json.loads(response.read())
     except Exception:
-        logger.exception("Telegram API error: %s", method)
         return None
 
 
@@ -188,15 +200,15 @@ def download_file(file_id, destination):
     result = telegram_json("getFile", {"file_id": file_id})
     if not result or not result.get("ok"):
         return False
+
     try:
-        path = result["result"]["file_path"]
+        remote_path = result["result"]["file_path"]
         urllib.request.urlretrieve(
-            f"https://api.telegram.org/file/bot{BOT_TOKEN}/{path}",
+            f"https://api.telegram.org/file/bot{BOT_TOKEN}/{remote_path}",
             destination,
         )
         return True
     except Exception:
-        logger.exception("Unable to download Telegram file")
         return False
 
 
@@ -221,9 +233,10 @@ def process_document(chat_id, document):
             return
 
         try:
-            raw_text = source.read_text(encoding="utf-8-sig")
-            cleaned, before, after, removed = clean_markdown(raw_text)
-            result_name = output_filename(file_name, raw_text)
+            raw = source.read_text(encoding="utf-8-sig")
+            cleaned, before, after, removed = clean_markdown(raw)
+
+            result_name = output_filename(file_name, raw)
             output = Path(directory) / result_name
             output.write_text(cleaned, encoding="utf-8")
 
@@ -238,7 +251,6 @@ def process_document(chat_id, document):
         except UnicodeDecodeError:
             send_message(chat_id, "Не удалось прочитать файл как UTF-8 Markdown.")
         except Exception:
-            logger.exception("Cleanup failed")
             send_message(chat_id, "Ошибка при очистке. Попробуйте ещё раз.")
 
 
@@ -265,7 +277,7 @@ class handler(BaseHTTPRequestHandler):
             send_message(
                 chat_id,
                 "Привет! Пришли .md-выгрузку Telegram Desktop. "
-                "Я уберу технический шум, но сохраню посты, ссылки и полезный текст.",
+                "Я удалю технический шум, но сохраню посты, ссылки и полезный текст.",
             )
         elif "document" in message:
             process_document(chat_id, message["document"])
