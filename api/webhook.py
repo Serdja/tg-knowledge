@@ -13,11 +13,9 @@ API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 MAX_FILE_SIZE = 20 * 1024 * 1024
 
 SERVICE_LINE = re.compile(
-    r"^\s*(?:"
-    r"(?:Channel|Group|Chat).*(?:created|photo changed|title changed)|"
+    r"^\s*(?:(?:Channel|Group|Chat).*(?:created|photo changed|title changed)|"
     r"(?:Канал|Группа|Чат).*(?:создан|изменил(?:а)? фото|изменил(?:а)? название)|"
-    r"(?:Создан(?:а)? (?:канал|группа|чат)|Изменено фото|Изменено название)"
-    r").*$",
+    r"(?:Создан(?:а)? (?:канал|группа|чат)|Изменено фото|Изменено название)).*$",
     re.IGNORECASE,
 )
 MEDIA_LINE = re.compile(r"^\s*!\[[^\]]*\]\([^)]*\)\s*$")
@@ -33,19 +31,51 @@ NUMBER_DATE = re.compile(
 TEXT_DATE = re.compile(r"^\s*(\d{1,2}\s+[A-Za-zА-Яа-яЁё]+\s+\d{4})\s*$")
 HEADING = re.compile(r"^\s*#\s+(.+?)\s*$")
 BAD_FILENAME = re.compile(r"[^\w. -]+", re.UNICODE)
-
-ATTACHMENT_NAME = re.compile(
-    r"^.+\.(?:pdf|doc|docx|xls|xlsx|ppt|pptx|zip|rar|7z|txt|csv|epub)$",
-    re.IGNORECASE,
-)
 FILE_SIZE = re.compile(r"^\s*\d+(?:[.,]\d+)?\s*(?:B|KB|MB|GB)\s*$", re.IGNORECASE)
-URL_LINE = re.compile(r"https?://", re.IGNORECASE)
+ATTACHMENT_EXTENSIONS = (
+    ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+    ".zip", ".rar", ".7z", ".txt", ".csv", ".epub",
+)
+
+
+def is_attachment_name(line):
+    return line.strip().lower().endswith(ATTACHMENT_EXTENSIONS)
+
+
+def remove_unavailable_attachments(lines):
+    result = []
+    removed = 0
+    index = 0
+
+    while index < len(lines):
+        line = lines[index]
+        next_line = lines[index + 1] if index + 1 < len(lines) else ""
+
+        if is_attachment_name(line) and FILE_SIZE.match(next_line):
+            end = index + 2
+            block = [line, next_line]
+
+            while end < len(lines) and lines[end].strip():
+                block.append(lines[end])
+                end += 1
+
+            has_url = any("http://" in item or "https://" in item for item in block)
+
+            if not has_url:
+                removed += len(block)
+                index = end
+                continue
+
+        result.append(line)
+        index += 1
+
+    return result, removed
 
 
 def clean_markdown(text):
     before = len(text.encode("utf-8"))
     raw = [line.rstrip() for line in text.splitlines()]
-    removed = 0
+    raw, removed = remove_unavailable_attachments(raw)
 
     counts = Counter(
         line for line in raw
@@ -68,33 +98,9 @@ def clean_markdown(text):
         line = raw[index]
         next_line = raw[index + 1] if index + 1 < len(raw) else ""
 
-        # Первое техническое имя экспортированного файла.
         if index == 0 and re.search(r"\s+\d+$", line):
             removed += 1
             index += 1
-            continue
-
-        # Блок недоступного вложения:
-        # «Название.pdf» + «1.3 MB» + один короткий анонс без URL.
-        if ATTACHMENT_NAME.match(line) and FILE_SIZE.match(next_line):
-            end = index + 2
-            block = [line, next_line]
-
-            while end < len(raw) and raw[end].strip():
-                block.append(raw[end])
-                end += 1
-
-            # Удаляем только короткие блоки без ссылок.
-            # Длинный текст после файла сохраняем как обычный пост.
-            has_url = any(URL_LINE.search(item) for item in block)
-            if not has_url and len(block) <= 3:
-                removed += len(block)
-                index = end
-                continue
-
-            # Если текст длиннее, убираем только имя файла и размер.
-            removed += 2
-            index += 2
             continue
 
         if line == "G":
@@ -102,7 +108,6 @@ def clean_markdown(text):
             index += 1
             continue
 
-        # Повторяющийся footer: «—» и «@канал — описание».
         if line == "—" and next_line.startswith("@") and "—" in next_line:
             if not source_written:
                 output.append(f"*Источник: {next_line.split('—', 1)[0].strip()}*")
@@ -147,7 +152,6 @@ def clean_markdown(text):
         previous_blank = blank
         index += 1
 
-    # Удаляем даты, в которых после очистки нет постов.
     result_lines = []
     for position, line in enumerate(output):
         if line.startswith("## "):
@@ -186,7 +190,6 @@ def telegram_json(method, payload):
         data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json"},
     )
-
     try:
         with urllib.request.urlopen(request, timeout=30) as response:
             return json.loads(response.read())
