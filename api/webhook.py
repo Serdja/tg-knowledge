@@ -34,6 +34,13 @@ TEXT_DATE = re.compile(r"^\s*(\d{1,2}\s+[A-Za-zА-Яа-яЁё]+\s+\d{4})\s*$")
 HEADING = re.compile(r"^\s*#\s+(.+?)\s*$")
 BAD_FILENAME = re.compile(r"[^\w. -]+", re.UNICODE)
 
+ATTACHMENT_NAME = re.compile(
+    r"^.+\.(?:pdf|doc|docx|xls|xlsx|ppt|pptx|zip|rar|7z|txt|csv|epub)$",
+    re.IGNORECASE,
+)
+FILE_SIZE = re.compile(r"^\s*\d+(?:[.,]\d+)?\s*(?:B|KB|MB|GB)\s*$", re.IGNORECASE)
+URL_LINE = re.compile(r"https?://", re.IGNORECASE)
+
 
 def clean_markdown(text):
     before = len(text.encode("utf-8"))
@@ -61,19 +68,41 @@ def clean_markdown(text):
         line = raw[index]
         next_line = raw[index + 1] if index + 1 < len(raw) else ""
 
-        # Первое имя файла экспорта, например «Central Александра Горного 1».
+        # Первое техническое имя экспортированного файла.
         if index == 0 and re.search(r"\s+\d+$", line):
             removed += 1
             index += 1
             continue
 
-        # Технический разделитель Telegram.
+        # Блок недоступного вложения:
+        # «Название.pdf» + «1.3 MB» + один короткий анонс без URL.
+        if ATTACHMENT_NAME.match(line) and FILE_SIZE.match(next_line):
+            end = index + 2
+            block = [line, next_line]
+
+            while end < len(raw) and raw[end].strip():
+                block.append(raw[end])
+                end += 1
+
+            # Удаляем только короткие блоки без ссылок.
+            # Длинный текст после файла сохраняем как обычный пост.
+            has_url = any(URL_LINE.search(item) for item in block)
+            if not has_url and len(block) <= 3:
+                removed += len(block)
+                index = end
+                continue
+
+            # Если текст длиннее, убираем только имя файла и размер.
+            removed += 2
+            index += 2
+            continue
+
         if line == "G":
             removed += 1
             index += 1
             continue
 
-        # Повторяющийся footer: «—» и следующая строка «@канал — описание».
+        # Повторяющийся footer: «—» и «@канал — описание».
         if line == "—" and next_line.startswith("@") and "—" in next_line:
             if not source_written:
                 output.append(f"*Источник: {next_line.split('—', 1)[0].strip()}*")
@@ -83,13 +112,11 @@ def clean_markdown(text):
             index += 2
             continue
 
-        # Сервисные строки, изображения и реакции.
         if SERVICE_LINE.match(line) or MEDIA_LINE.match(line) or REACTION_LINE.match(line):
             removed += 1
             index += 1
             continue
 
-        # Повтор канала оставляем один раз как заголовок.
         if line in channel_titles:
             if not title_written:
                 output.append(f"# {line}")
@@ -120,7 +147,7 @@ def clean_markdown(text):
         previous_blank = blank
         index += 1
 
-    # Убираем даты, в которых после очистки не осталось ни одного поста.
+    # Удаляем даты, в которых после очистки нет постов.
     result_lines = []
     for position, line in enumerate(output):
         if line.startswith("## "):
@@ -142,11 +169,13 @@ def clean_markdown(text):
 
 def output_filename(original_name, text):
     stem = Path(original_name).stem or "telegram-export"
+
     for line in text.splitlines():
         heading = HEADING.match(line)
         if heading:
             stem = heading.group(1)
             break
+
     stem = BAD_FILENAME.sub("-", stem).strip(" .-")
     return f"{(stem or 'telegram-export')[:100]}.clean.md"
 
@@ -157,6 +186,7 @@ def telegram_json(method, payload):
         data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json"},
     )
+
     try:
         with urllib.request.urlopen(request, timeout=30) as response:
             return json.loads(response.read())
@@ -192,6 +222,7 @@ def send_document(chat_id, path, filename, caption):
         data=bytes(body),
         headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
     )
+
     with urllib.request.urlopen(request, timeout=90):
         pass
 
