@@ -5,9 +5,9 @@ import re
 import tempfile
 import urllib.request
 import uuid
+from collections import Counter
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
-
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -30,9 +30,12 @@ REACTION_LINE = re.compile(
     r"(?:\s*\d+)?\s*)+$"
 )
 TIME_LINE = re.compile(r"^\s*(?:\*\*)?(\d{1,2}:\d{2})(?:\*\*)?\s*$")
-DATE_LINE = re.compile(
+NUMBER_DATE_LINE = re.compile(
     r"^\s*(?:#{1,6}\s*)?"
     r"(\d{1,2}[./-]\d{1,2}[./-]\d{2,4}|\d{4}[./-]\d{1,2}[./-]\d{1,2})\s*$"
+)
+TEXT_DATE_LINE = re.compile(
+    r"^\s*(\d{1,2}\s+[A-Za-zА-Яа-яЁё]+\s+\d{4})\s*$"
 )
 HEADING_LINE = re.compile(r"^\s*#\s+(.+?)\s*$")
 INVALID_FILENAME = re.compile(r"[^\w. -]+", re.UNICODE)
@@ -40,36 +43,84 @@ INVALID_FILENAME = re.compile(r"[^\w. -]+", re.UNICODE)
 
 def clean_markdown(text):
     source_bytes = len(text.encode("utf-8"))
-    lines = []
+    raw_lines = [line.rstrip() for line in text.splitlines()]
+
+    counts = Counter(
+        line for line in raw_lines
+        if line.strip()
+        and len(line) < 120
+        and not line.startswith(("http://", "https://", "#", "*", "—", "@"))
+        and not NUMBER_DATE_LINE.match(line)
+        and not TEXT_DATE_LINE.match(line)
+        and not TIME_LINE.match(line)
+    )
+    channel_titles = {line for line, count in counts.items() if count >= 3}
+
+    output = []
     removed = 0
     previous_blank = True
+    title_written = False
+    source_written = False
+    index = 0
 
-    for raw_line in text.splitlines():
-        line = raw_line.rstrip()
+    while index < len(raw_lines):
+        line = raw_lines[index]
+        next_line = raw_lines[index + 1] if index + 1 < len(raw_lines) else ""
+
+        if line == "G":
+            removed += 1
+            index += 1
+            continue
+
+        if line == "—" and next_line.startswith("@") and "—" in next_line:
+            if not source_written:
+                source_name = next_line.split("—", 1)[0].strip()
+                output.append(f"*Источник: {source_name}*")
+                previous_blank = False
+                source_written = True
+            removed += 2
+            index += 2
+            continue
 
         if SERVICE_LINE.match(line) or MEDIA_LINE.match(line) or REACTION_LINE.match(line):
             removed += 1
+            index += 1
             continue
 
-        date = DATE_LINE.match(line)
-        if date:
-            line = f"## {date.group(1)}"
+        if line in channel_titles:
+            if not title_written:
+                output.append(f"# {line}")
+                previous_blank = False
+                title_written = True
+            else:
+                removed += 1
+            index += 1
+            continue
 
+        number_date = NUMBER_DATE_LINE.match(line)
+        text_date = TEXT_DATE_LINE.match(line)
         time = TIME_LINE.match(line)
-        if time:
+
+        if number_date:
+            line = f"## {number_date.group(1)}"
+        elif text_date:
+            line = f"## {text_date.group(1)}"
+        elif time:
             line = f"*{time.group(1)}*"
 
         blank = not line.strip()
         if blank and previous_blank:
+            index += 1
             continue
 
-        lines.append(line)
+        output.append(line)
         previous_blank = blank
+        index += 1
 
-    while lines and not lines[-1].strip():
-        lines.pop()
+    while output and not output[-1].strip():
+        output.pop()
 
-    result = "\n".join(lines)
+    result = "\n".join(output)
     if result:
         result += "\n"
 
@@ -78,13 +129,11 @@ def clean_markdown(text):
 
 def output_filename(original_name, text):
     stem = Path(original_name).stem or "telegram-export"
-
     for line in text.splitlines():
         heading = HEADING_LINE.match(line)
-        if heading and not DATE_LINE.match(heading.group(1)):
+        if heading and not NUMBER_DATE_LINE.match(heading.group(1)):
             stem = heading.group(1)
             break
-
     stem = INVALID_FILENAME.sub("-", stem).strip(" .-")
     return f"{(stem or 'telegram-export')[:100]}.clean.md"
 
@@ -95,7 +144,6 @@ def telegram_json(method, payload):
         data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json"},
     )
-
     try:
         with urllib.request.urlopen(request, timeout=30) as response:
             return json.loads(response.read())
@@ -110,18 +158,12 @@ def send_message(chat_id, text):
 
 def send_document(chat_id, path, filename, caption):
     boundary = uuid.uuid4().hex
-    file_content = path.read_bytes()
-
-    fields = [
-        ("chat_id", str(chat_id).encode("utf-8")),
-        ("caption", caption.encode("utf-8")),
-    ]
-
     body = bytearray()
-    for key, value in fields:
+
+    for key, value in (("chat_id", str(chat_id)), ("caption", caption)):
         body.extend(f"--{boundary}\r\n".encode())
         body.extend(f'Content-Disposition: form-data; name="{key}"\r\n\r\n'.encode())
-        body.extend(value)
+        body.extend(value.encode("utf-8"))
         body.extend(b"\r\n")
 
     body.extend(f"--{boundary}\r\n".encode())
@@ -129,7 +171,7 @@ def send_document(chat_id, path, filename, caption):
         f'Content-Disposition: form-data; name="document"; filename="{filename}"\r\n'.encode()
     )
     body.extend(b"Content-Type: text/markdown\r\n\r\n")
-    body.extend(file_content)
+    body.extend(path.read_bytes())
     body.extend(b"\r\n")
     body.extend(f"--{boundary}--\r\n".encode())
 
@@ -138,7 +180,6 @@ def send_document(chat_id, path, filename, caption):
         data=bytes(body),
         headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
     )
-
     with urllib.request.urlopen(request, timeout=90):
         pass
 
@@ -147,12 +188,12 @@ def download_file(file_id, destination):
     result = telegram_json("getFile", {"file_id": file_id})
     if not result or not result.get("ok"):
         return False
-
-    remote_path = result["result"]["file_path"]
-    url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{remote_path}"
-
     try:
-        urllib.request.urlretrieve(url, destination)
+        path = result["result"]["file_path"]
+        urllib.request.urlretrieve(
+            f"https://api.telegram.org/file/bot{BOT_TOKEN}/{path}",
+            destination,
+        )
         return True
     except Exception:
         logger.exception("Unable to download Telegram file")
@@ -163,14 +204,11 @@ def process_document(chat_id, document):
     file_name = document.get("file_name", "telegram-export.md")
 
     if Path(file_name).suffix.lower() != ".md":
-        send_message(
-            chat_id,
-            "Пришли, пожалуйста, Markdown-файл .md — выгрузку из Telegram Desktop.",
-        )
+        send_message(chat_id, "Пришли Markdown-файл .md из Telegram Desktop.")
         return
 
     if document.get("file_size", 0) > MAX_FILE_SIZE:
-        send_message(chat_id, "Файл больше 20 МБ. Для Vercel сейчас доступны файлы до 20 МБ.")
+        send_message(chat_id, "Файл больше 20 МБ. Для Vercel доступны файлы до 20 МБ.")
         return
 
     send_message(chat_id, "⏳ Очищаю Telegram Markdown…")
@@ -194,19 +232,19 @@ def process_document(chat_id, document):
                 chat_id,
                 output,
                 result_name,
-                f"Готово: {before} → {after} байт (−{percent}%). Удалено служебных строк: {removed}.",
+                f"Готово: {before} → {after} байт (−{percent}%). "
+                f"Удалено служебных строк: {removed}.",
             )
         except UnicodeDecodeError:
             send_message(chat_id, "Не удалось прочитать файл как UTF-8 Markdown.")
         except Exception:
             logger.exception("Cleanup failed")
-            send_message(chat_id, "Ошибка при очистке. Попробуйте отправить файл ещё раз.")
+            send_message(chat_id, "Ошибка при очистке. Попробуйте ещё раз.")
 
 
 class handler(BaseHTTPRequestHandler):
     def do_POST(self):
-        length = int(self.headers.get("Content-Length", "0"))
-        body = self.rfile.read(length)
+        body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
 
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -214,11 +252,10 @@ class handler(BaseHTTPRequestHandler):
         self.wfile.write(b'{"ok":true}')
 
         try:
-            update = json.loads(body)
+            message = json.loads(body).get("message")
         except json.JSONDecodeError:
             return
 
-        message = update.get("message")
         if not message:
             return
 
@@ -228,8 +265,7 @@ class handler(BaseHTTPRequestHandler):
             send_message(
                 chat_id,
                 "Привет! Пришли .md-выгрузку Telegram Desktop. "
-                "Я уберу служебные сообщения, фото-превью и реакции, "
-                "а затем верну файл с окончанием .clean.md. Исходник не изменяется.",
+                "Я уберу технический шум, но сохраню посты, ссылки и полезный текст.",
             )
         elif "document" in message:
             process_document(chat_id, message["document"])
