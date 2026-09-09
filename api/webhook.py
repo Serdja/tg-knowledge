@@ -31,15 +31,21 @@ NUMBER_DATE = re.compile(
 TEXT_DATE = re.compile(r"^\s*(\d{1,2}\s+[A-Za-zА-Яа-яЁё]+\s+\d{4})\s*$")
 HEADING = re.compile(r"^\s*#\s+(.+?)\s*$")
 BAD_FILENAME = re.compile(r"[^\w. -]+", re.UNICODE)
-FILE_SIZE = re.compile(r"^\s*\d+(?:[.,]\d+)?\s*(?:B|KB|MB|GB)\s*$", re.IGNORECASE)
+FILE_SIZE = re.compile(r"\d+(?:[.,]\d+)?\s*(?:B|KB|MB|GB)", re.IGNORECASE)
+
 ATTACHMENT_EXTENSIONS = (
     ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
     ".zip", ".rar", ".7z", ".txt", ".csv", ".epub",
 )
 
 
+def normalized_line(line):
+    return line.replace("\\_", "_").replace("\\.", ".").lower()
+
+
 def is_attachment_name(line):
-    return line.strip().lower().endswith(ATTACHMENT_EXTENSIONS)
+    clean = normalized_line(line)
+    return any(extension in clean for extension in ATTACHMENT_EXTENSIONS)
 
 
 def remove_unavailable_attachments(lines):
@@ -51,15 +57,21 @@ def remove_unavailable_attachments(lines):
         line = lines[index]
         next_line = lines[index + 1] if index + 1 < len(lines) else ""
 
-        if is_attachment_name(line) and FILE_SIZE.match(next_line):
+        # Имя потенциального файла + следующая строка с размером.
+        if is_attachment_name(line) and FILE_SIZE.search(next_line):
             end = index + 2
             block = [line, next_line]
 
+            # Берём весь блок до первой пустой строки.
             while end < len(lines) and lines[end].strip():
                 block.append(lines[end])
                 end += 1
 
-            has_url = any("http://" in item or "https://" in item for item in block)
+            # Ссылка делает материал доступным — такой блок не трогаем.
+            has_url = any(
+                "http://" in item.lower() or "https://" in item.lower()
+                for item in block
+            )
 
             if not has_url:
                 removed += len(block)
