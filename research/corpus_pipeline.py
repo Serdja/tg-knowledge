@@ -295,11 +295,24 @@ def prepare(args: argparse.Namespace) -> None:
     if any(out.iterdir()):
         raise ValueError(f"Run directory is not empty: {out}")
     rows, source_summary = load_records(source)
-    groups = pack_rows(rows, args.group_chars, args.group_records)
+    canonical_rows: list[dict[str, Any]] = []
+    duplicate_map: dict[str, list[str]] = {}
+    canonical_by_hash: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        digest = row["sha256"]
+        canonical = canonical_by_hash.get(digest)
+        if canonical and canonical["text"] == row["text"]:
+            duplicate_map[canonical["id"]].append(row["id"])
+        else:
+            canonical_by_hash[digest] = row
+            canonical_rows.append(row)
+            duplicate_map[row["id"]] = [row["id"]]
+    groups = pack_rows(canonical_rows, args.group_chars, args.group_records)
     id_map: dict[str, list[str]] = {}
     with (out / "source-snapshot.jsonl").open("w", encoding="utf-8", newline="\n") as snap:
         for row in rows:
             snap.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
+    write_json(out / "duplicate-map.json", duplicate_map)
     with (out / "batch-input.jsonl").open("w", encoding="utf-8", newline="\n") as batch:
         for number, group in enumerate(groups, 1):
             key = f"group-{number:06d}"
@@ -311,6 +324,8 @@ def prepare(args: argparse.Namespace) -> None:
         "input_path": str(source),
         "input_sha256": sha256_file(source),
         "record_count": len(rows),
+        "unique_content_records": len(canonical_rows),
+        "exact_duplicate_records_reused": len(rows) - len(canonical_rows),
         "group_count": len(groups),
         "source_characters": sum(len(r["text"]) for r in rows),
         "source_summary": source_summary.get("summary", {}),
@@ -319,11 +334,13 @@ def prepare(args: argparse.Namespace) -> None:
         "batch_jsonl_sha256": sha256_file(out / "batch-input.jsonl"),
         "snapshot_sha256": sha256_file(out / "source-snapshot.jsonl"),
         "request_map_sha256": sha256_file(out / "request-map.json"),
+        "duplicate_map_sha256": sha256_file(out / "duplicate-map.json"),
         "status": "prepared_offline",
         "human_reviewed": 0,
     }
     write_json(out / "manifest.json", manifest)
-    print(json.dumps({"run_dir": str(out), "records": len(rows), "requests": len(groups),
+    print(json.dumps({"run_dir": str(out), "records": len(rows), "unique_texts_analyzed": len(canonical_rows),
+                      "exact_duplicate_records_reused": len(rows) - len(canonical_rows), "requests": len(groups),
                       "source_chars": manifest["source_characters"], "batch_file_bytes": (out / "batch-input.jsonl").stat().st_size,
                       "status": "prepared; no data uploaded"}, ensure_ascii=False, indent=2))
 
@@ -540,9 +557,15 @@ def validate(args: argparse.Namespace) -> None:
     request_map = json.loads((run / "request-map.json").read_text(encoding="utf-8"))
     if sha256_file(run / "request-map.json") != manifest["request_map_sha256"]:
         raise ValueError("Request map SHA-256 mismatch")
+    duplicate_map = json.loads((run / "duplicate-map.json").read_text(encoding="utf-8"))
+    if sha256_file(run / "duplicate-map.json") != manifest["duplicate_map_sha256"]:
+        raise ValueError("Duplicate map SHA-256 mismatch")
     all_expected = [rid for ids in request_map.values() for rid in ids]
-    if len(all_expected) != len(set(all_expected)) or set(all_expected) != set(sources):
-        raise ValueError("Request map does not cover each source record exactly once")
+    flattened = [rid for ids in duplicate_map.values() for rid in ids]
+    if (len(all_expected) != len(set(all_expected)) or set(all_expected) != set(duplicate_map)
+            or len(flattened) != len(set(flattened)) or set(flattened) != set(sources)
+            or any(canonical not in ids for canonical, ids in duplicate_map.items())):
+        raise ValueError("Request and duplicate maps do not account for every source record exactly once")
     result_path = Path(args.results) if args.results else run / "batch-results.jsonl"
     parsed: dict[str, dict[str, Any]] = {}
     group_errors: dict[str, str] = {}
@@ -593,14 +616,21 @@ def validate(args: argparse.Namespace) -> None:
         group_error = group_errors.get(key)
         if not group_error and set(group) != set(expected_ids):
             group_error = "response_id_set_mismatch"
-        for rid in expected_ids:
+        for canonical_id in expected_ids:
+            duplicate_ids = duplicate_map[canonical_id]
             if group_error:
-                output_rows.append({"id": rid, "source_sha256": sources[rid]["sha256"],
-                                    "source_chars": len(sources[rid]["text"]),
-                                    "status": "NEEDS_REVIEW", "human_reviewed": False,
-                                    "validation_errors": [group_error]})
+                for rid in duplicate_ids:
+                    output_rows.append({"id": rid, "source_sha256": sources[rid]["sha256"],
+                                        "source_chars": len(sources[rid]["text"]),
+                                        "status": "NEEDS_REVIEW", "human_reviewed": False,
+                                        "validation_errors": [group_error]})
             else:
-                output_rows.append(normalize_model_record(group[rid], sources[rid]))
+                for rid in duplicate_ids:
+                    result_row = normalize_model_record(group[canonical_id], sources[rid])
+                    if rid != canonical_id:
+                        result_row["duplicate_content_of"] = canonical_id
+                    result_row["duplicate_group_size"] = len(duplicate_ids)
+                    output_rows.append(result_row)
     with (run / "validated-results.jsonl").open("w", encoding="utf-8", newline="\n") as handle:
         for row in output_rows:
             handle.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
@@ -619,6 +649,8 @@ def summarize(manifest: dict[str, Any], rows: list[dict[str, Any]], parsed_group
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "source_files": len(manifest.get("sources", [])),
         "records_in_source": manifest["record_count"],
+        "unique_texts_analyzed": manifest.get("unique_content_records", manifest["record_count"]),
+        "exact_duplicate_records_reused": manifest.get("exact_duplicate_records_reused", 0),
         "records_with_a_result_row": len(rows),
         "records_with_model_response": sum("model_result" in r for r in rows),
         "records_model_grounded_by_exact_quote_check": status_counts.get("MODEL_RESULT_GROUNDED", 0),
@@ -647,6 +679,8 @@ def make_dashboard(summary: dict[str, Any], results_path: Path, out_path: Path) 
         bars.append(f'<div class="barrow"><span>{html.escape(topic)}</span><div class="track"><i style="width:{width}px"></i></div><b>{count:,}</b></div>')
     stats = [
         ("Records", summary["records_in_source"]),
+        ("Unique texts analyzed", summary["unique_texts_analyzed"]),
+        ("Exact repeats reused", summary["exact_duplicate_records_reused"]),
         ("Model-grounded", summary["records_model_grounded_by_exact_quote_check"]),
         ("Needs review / retry", summary["records_needing_review_or_retry"]),
         ("Human reviewed", summary["human_reviewed_records"]),
@@ -788,6 +822,8 @@ def export_obsidian(args: argparse.Namespace) -> None:
         "# Индекс полного разбора корпуса\n\n"
         f"- Исходных файлов: {summary.get('source_files', 0)}\n"
         f"- Фрагментов: {summary['records_in_source']}\n"
+        f"- Уникальных текстов для модели: {summary['unique_texts_analyzed']}\n"
+        f"- Повторы, обработанные один раз: {summary['exact_duplicate_records_reused']}\n"
         f"- Модель вернула ответы: {summary['records_with_model_response']} ({summary['model_response_coverage_percent']}%)\n"
         f"- Прошли автоматическую проверку точных цитат: {summary['records_model_grounded_by_exact_quote_check']}\n"
         f"- Очередь повторной проверки: {summary['records_needing_review_or_retry']}\n"
