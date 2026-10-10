@@ -119,6 +119,32 @@ class CorpusPipelineTest(unittest.TestCase):
         self.assertEqual([r["id"] for r in snapshot], ["F00001", "F00002"])
         self.assertEqual(snapshot[1]["text"], variant_text)
 
+    def test_exact_duplicate_text_is_analyzed_once_but_retained_for_each_occurrence(self):
+        source = self._source(["Одинаковый совет: поговорить с клиентами.", "Одинаковый совет: поговорить с клиентами."])
+        run = self._prepare(source)
+        manifest = json.loads((run / "manifest.json").read_text(encoding="utf-8"))
+        mapping = json.loads((run / "request-map.json").read_text(encoding="utf-8"))
+        duplicates = json.loads((run / "duplicate-map.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["unique_content_records"], 1)
+        self.assertEqual(manifest["exact_duplicate_records_reused"], 1)
+        self.assertEqual(len(mapping), 1)
+        canonical = next(iter(duplicates))
+        answer = {"records": [{"id": canonical, "topic_ids": ["pain"], "kind": "RECOMMENDATION",
+                               "summary": "Поговорить с клиентами.", "findings": [{
+                                   "type": "recommendation", "text": "Поговорить с клиентами",
+                                   "evidence_quote": "поговорить с клиентами", "promotional": False,
+                                   "needs_external_verification": True}], "tools": [], "confidence": 0.9,
+                               "uncertainty": ""}]}
+        key = next(iter(mapping))
+        result = {"key": key, "response": {"candidates": [{"content": {"parts": [{"text": json.dumps(answer, ensure_ascii=False)}]}}]}}
+        result_path = run / "results.jsonl"
+        result_path.write_text(json.dumps(result, ensure_ascii=False) + "\n", encoding="utf-8")
+        pipeline.validate(Namespace(run_dir=str(run), results=str(result_path)))
+        rows = [json.loads(line) for line in (run / "validated-results.jsonl").read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(all(row["status"] == "MODEL_RESULT_GROUNDED" for row in rows))
+        self.assertEqual(sum(bool(row.get("duplicate_content_of")) for row in rows), 1)
+
     def test_obsidian_export_reconstructs_original_source_bytes(self):
         raw = "\ufeffПривет\r\nЭто тестовая выгрузка 🚀\r\n" + "y" * 600
         source = self.root / "telegram.md"
