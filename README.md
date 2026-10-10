@@ -21,7 +21,7 @@ python research/corpus_pipeline.py prepare --input ./work/corpus.json --run-dir 
 
 `ingest` walks every `.md`, `.markdown`, and `.txt` file. It splits by line boundaries near 4,000 characters and verifies that concatenating all chunks recreates each source byte-for-byte (UTF-8). It records the file SHA-256, character offsets, and line ranges. It does not trim, normalize, deduplicate, or discard source text.
 
-`prepare` verifies each record hash, preserves a JSONL source snapshot, and creates a Gemini JSONL file. Related fragments that were stored as `variants` are expanded into separate records, rather than skipped. The output records map each model result to the exact source id and offsets.
+`prepare` verifies each record hash, preserves a JSONL source snapshot, and creates a Gemini JSONL file. Related fragments stored as `variants` are expanded into separate records. Byte-identical text is sent to the model once, while every original occurrence remains in the snapshot and gets its own result row and source location. The output records map each model result to the exact source id and offsets.
 
 ## Semantic batch processing
 
